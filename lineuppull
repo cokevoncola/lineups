@@ -1,0 +1,159 @@
+# tools/fetch_lineups_statsapi.py
+from __future__ import annotations
+
+import sys, json, time, datetime as dt
+from typing import Dict, Any, List
+import requests
+import pandas as pd
+
+BASE = "https://statsapi.mlb.com/api/v1"
+
+def _get(url: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def _date_str(arg: str | None) -> str:
+    if arg:
+        return arg
+    return dt.date.today().isoformat()
+
+def _game_key(g: Dict[str, Any]) -> str:
+    a = g["teams"]["away"]["team"]["abbreviation"]
+    h = g["teams"]["home"]["team"]["abbreviation"]
+    d = g["gameDate"][:10]
+    return f"{d}_{a}@{h}"
+
+def _home_away(team_side: str) -> str:
+    return "home" if team_side == "home" else "away"
+
+def _team_abbrev(team_obj: Dict[str, Any]) -> str:
+    return team_obj.get("team", {}).get("abbreviation") or team_obj.get("team", {}).get("triCode") or team_obj.get("team", {}).get("name")
+
+def _prob_pitcher_id(team_obj: Dict[str, Any]) -> int | None:
+    pp = team_obj.get("probablePitcher")
+    if isinstance(pp, dict):
+        return pp.get("id")
+    return None
+
+def fetch_lineups_for_date(date_str: str) -> pd.DataFrame:
+    # 1) schedule with games + probable pitchers
+    sched = _get(f"{BASE}/schedule", params={"sportId": 1, "date": date_str, "hydrate": "probablePitcher,team"})
+    dates = sched.get("dates", [])
+    rows: List[Dict[str, Any]] = []
+    game_number = 1
+
+    for d in dates:
+        for g in d.get("games", []):
+            gamePk = g["gamePk"]
+            gkey = _game_key(g)
+            date = g["gameDate"][:10]
+
+            # quick team abbrevs
+            away_abbr = _team_abbrev(g["teams"]["away"])
+            home_abbr = _team_abbrev(g["teams"]["home"])
+            matchup_key = gkey
+
+            # 2) per-game live data (lineups appear in boxscore once posted; otherwise we at least have probable SPs)
+            live = _get(f"{BASE}/game/{gamePk}/boxscore")
+            teams = live.get("teams", {})
+
+            for side, opp_side in (("away","home"),("home","away")):
+                side_obj = teams.get(side, {})
+                opp_obj  = teams.get(opp_side, {})
+
+                team = side_obj.get("team", {}).get("abbreviation") or away_abbr if side=="away" else home_abbr
+                opponent = opp_obj.get("team", {}).get("abbreviation") or (home_abbr if side=="away" else away_abbr)
+
+                # batting order: boxscore lists players with battingOrder like "1", "2", ...; pitcher role is "probablePitcher" or "pitcher"
+                players = side_obj.get("players", {})
+                # Build hitters
+                hitters = []
+                for pid_key, pobj in players.items():
+                    info = pobj.get("person", {})
+                    pid = info.get("id")
+                    bo  = pobj.get("battingOrder")
+                    pos = pobj.get("position", {}).get("abbreviation")
+                    bats= info.get("batSide", {}).get("code") or info.get("batSide", {}).get("description")
+                    if bo:  # batting order present means hitter
+                        try:
+                            order = int(str(bo).strip())
+                        except Exception:
+                            continue
+                        hitters.append((order, pid, info.get("fullName"), bats))
+
+                hitters.sort(key=lambda t: t[0])  # order 1..9
+
+                # probable SP (fallback if lineup not yet posted)
+                sp_id = _prob_pitcher_id(g["teams"][side]) or _prob_pitcher_id(side_obj) or None
+                sp_name = None
+                sp_bats = "R"
+                if sp_id:
+                    # hydrate person endpoint for bats info
+                    try:
+                        person = _get(f"{BASE}/people/{sp_id}")
+                        ppl = person.get("people", [])
+                        if ppl:
+                            sp_name = ppl[0].get("fullName")
+                            sp_bats = ppl[0].get("batSide", {}).get("code") or "R"
+                    except Exception:
+                        pass
+
+                # Emit hitters 1..9 (if available)
+                for order, pid, name, bats in hitters[:9]:
+                    rows.append({
+                        "game_date": date,
+                        "game_number": game_number,
+                        "game_key": gkey,
+                        "team": team,
+                        "opponent": opponent,
+                        "home_away": _home_away(side),
+                        "player_name": name,
+                        "mlbid": pid,
+                        "bats": (bats or "R")[:1].upper(),
+                        "batting_order": order,
+                        "is_sp": False,
+                        "matchup_key": matchup_key,
+                    })
+
+                # Emit SP row (always; this is what we really need for K sims)
+                if sp_id:
+                    rows.append({
+                        "game_date": date,
+                        "game_number": game_number,
+                        "game_key": gkey,
+                        "team": team,
+                        "opponent": opponent,
+                        "home_away": _home_away(side),
+                        "player_name": sp_name or "SP",
+                        "mlbid": sp_id,
+                        "bats": (sp_bats or "R")[:1].upper(),
+                        "batting_order": "SP",
+                        "is_sp": True,
+                        "matchup_key": matchup_key,
+                    })
+
+            game_number += 1
+            time.sleep(0.2)  # be nice
+
+    df = pd.DataFrame(rows)
+    # Type hygiene
+    if not df.empty:
+        df["mlbid"] = pd.to_numeric(df["mlbid"], errors="coerce").astype("Int64")
+        # Keep only the columns our app expects
+        cols = ["game_date","game_number","game_key","team","opponent","home_away",
+                "player_name","mlbid","bats","batting_order","is_sp","matchup_key"]
+        df = df[cols]
+    return df
+
+if __name__ == "__main__":
+    date = _date_str(sys.argv[1] if len(sys.argv) > 1 else None)
+    out = fetch_lineups_for_date(date)
+    out.to_csv(f"Lineups_{date}.csv", index=False)
+    print(f"Wrote Lineups_{date}.csv with shape {out.shape}")
+
+
+RUN IT WITH:
+
+python tools/fetch_lineups_statsapi.py 2025-08-19  # specific date
+
